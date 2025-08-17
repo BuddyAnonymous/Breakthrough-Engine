@@ -26,8 +26,68 @@ MASK64 = 0xFFFFFFFFFFFFFFFF  # 64-bit mask
 DEPTH = 14
 evalTime = 0
 globalCounter = 0
+W_MATERIAL = 100
+W_ADVANCE  = 20
+W_MOB      = 5
+W_CAPTURE  = 50
+#W_PASSED   = 60
+#W_PASSED_DIST = 12
+W_SUPPORT  = 8
+W_CONNECTED = 8
+W_BLOCKED  = -8
+W_CENTER   = 3
+INF = 10**9
+center_table = [0]*64
+# assume ring_mask_1..3 are defined bitboards
+for sq in range(64):
+    mask = 1 << sq
+    if mask & ring_mask_1:
+        center_table[sq] = W_CENTER * 3
+    elif mask & ring_mask_2:
+        center_table[sq] = W_CENTER * 2
+    elif mask & ring_mask_3:
+        center_table[sq] = W_CENTER * 1
+    else:
+        center_table[sq] = 0
+
+adv_table_white = [0]*64
+adv_table_black = [0]*64
+for sq in range(64):
+    rank = sq // 8
+    # original had: add rank, and if rank > 4 some quadratic bonus
+    val = rank
+    if rank > 4:
+        val += (4*(rank - 4))**2
+    adv_table_white[sq] = val
+
+    # for black your code subtracts (7 - rank) and if rank < 3 adds penalty
+    valb = (7 - rank)
+    if rank < 3:
+        valb += (4*(3 - rank))**2
+    adv_table_black[sq] = valb
+
+def _sum_table_for_bitboard(bb, table):
+    s = 0
+    while bb:
+        lsb = bb & -bb
+        idx = lsb.bit_length() - 1
+        s += table[idx]
+        bb ^= lsb
+    return s
 
 advancement = {7: 10000000, 6: 10000 , 5:200, 0:10000000, 1:10000, 2:200}
+
+_eval_cache = {}
+
+def evaluate_board_cached(white, black, hash_key=None):
+    if hash_key is not None:
+        v = _eval_cache.get(hash_key)
+        if v is not None:
+            return v
+    score = evaluate_board(white, black)   # your existing, pure evaluator
+    if hash_key is not None:
+        _eval_cache[hash_key] = score
+    return score
 
 def print_board(white, black):
     print("  +-----------------+")
@@ -86,138 +146,142 @@ def generate_all_white_moves(white,black):
 
     return all_moves
 
+def generate_all_white_moves(white, black):
+    moves = []
+    full = white | black
+    for from_sq in bit_scan(white):
+        # forward
+        to = from_sq + 8
+        if to < 64 and not ((full >> to) & 1):
+            moves.append((from_sq, to))
+        # diag-left
+        to = from_sq + 9
+        if to < 64 and not ((1 << from_sq) & left_edge) and not ((white >> to) & 1):   # not on right edge
+            # allow diagonal move to empty or capture
+            moves.append((from_sq, to))
+        # diag-right
+        to = from_sq + 7
+        if to < 64 and not ((1 << from_sq) & right_edge) and not ((white >> to) & 1):    # not on left edge
+            moves.append((from_sq, to))
+    return moves
+
 def generate_all_black_moves(white,black):
-    down_moves = (black >> 8) & ~(white | black) & MASK64
-    down_left_moves = (black >> 7) & ~(black | right_edge) & MASK64
-    down_right_moves = (black >> 9) & ~(black | left_edge) & MASK64
-    all_black_moves = down_moves | down_left_moves | down_right_moves
-    all_moves = []
+    moves = []
+    full = white | black
 
-    for to_sq in bit_scan(all_black_moves):
-        from_candidates = []
-        if to_sq < 56 and ((1 << (to_sq + 8)) & black) and not ((1 << to_sq) & (white | black)):
-            all_moves.append((to_sq + 8, to_sq))
-        if to_sq < 55 and ((1 << (to_sq + 9)) & black & ~right_edge):
-            all_moves.append((to_sq + 9, to_sq))
-        if to_sq < 57 and ((1 << (to_sq + 7)) & black & ~left_edge):
-            all_moves.append((to_sq + 7, to_sq))
-        for from_sq in from_candidates:
-            all_moves.append((from_sq, to_sq))
+    for from_sq in bit_scan(black):
+        to = from_sq - 8
+        if to >= 0 and not ((full >> to) & 1):
+            moves.append((from_sq, to))
+        to = from_sq - 9
+        if to >= 0 and not ((1 << from_sq) & right_edge) and not ((black >> to) & 1):  # not on left edge
+            moves.append((from_sq, to))
+        to = from_sq - 7
+        if to >= 0 and not ((1 << from_sq) & left_edge) and not ((black >> to) & 1):  # not on right edge
+            moves.append((from_sq, to))
+    return moves
 
-    return all_moves
+def order_moves(moves, white, black, whiteToMove, pv_move=None, tt_move=None):
+    # precompute frequently used lookups
+    opp = black if whiteToMove else white
+    center_bonus = {27, 28, 35, 36}  # set lookup = O(1)
 
-def order_moves(moves, white, black, whiteToMove, pv_move=None, tt_move = None):
-    def move_score(move):
+    def key(move):
         from_sq, to_sq = move
         score = 0
 
-        # 1. Captures get high priority
-        if (whiteToMove and (1 << to_sq) & black) or (not whiteToMove and (1 << to_sq) & white):
+        # 1. Captures
+        if (opp >> to_sq) & 1:
             score += 100
 
-        # 2. Advance more = better
+        # 2. Advancement
+        rank = to_sq // 8
         if whiteToMove:
-            score += (to_sq // 8) * 5  # deeper ranks = more points
-            if to_sq // 8 > 4:
-                score += advancement[to_sq // 8]  # bonus for advancing to rank 5 or higher
+            score += rank * 5
+            if rank > 4:
+                score += advancement[rank]
         else:
-            score += ((7 - to_sq // 8) * 5)  # deeper ranks = more points
-            if to_sq // 8 < 3:
-                score += advancement[to_sq // 8]
+            score += (7 - rank) * 5
+            if rank < 3:
+                score += advancement[rank]
 
-        # 3. Central squares = better
-        center_bonus = [27, 28, 35, 36]  # or bigger mask
+        # 3. Center bonus
         if to_sq in center_bonus:
             score += 10
-        
-        if pv_move and move == pv_move:
-            score += 1000
 
-        if tt_move and move == tt_move:
+        # 4. PV/TT
+        if move == pv_move:
+            score += 1000
+        elif move == tt_move:
             score += 500
 
         return score
 
-    return sorted(moves, key=move_score, reverse=True)
+    return sorted(moves, key=key, reverse=True)
 
 def evaluate_board(white,black):
-    global globalCounter
-    global evalTime
-    start = time.perf_counter()
+    #global globalCounter
 
-    globalCounter += 1
+    #globalCounter += 1
+    W_MATERIAL_l = W_MATERIAL
+    W_ADVANCE_l = W_ADVANCE
+    W_MOB_l = W_MOB
+    W_CAPTURE_l = W_CAPTURE
+    W_BLOCKED_l = W_BLOCKED
+    INF_l = INF
+    re = right_edge
+    le = left_edge
+    adv_w = adv_table_white
+    adv_b = adv_table_black
+    center_tbl = center_table
+    calc_mob_w = calc_mobility_white
+    calc_mob_b = calc_mobility_black
+    sum_tbl = _sum_table_for_bitboard
+    white_goal_rank = white_goal_rank7
+    black_goal_rank = black_goal_rank0
 
-    W_MATERIAL = 100
-    W_ADVANCE  = 20
-    W_MOB      = 5
-    W_CAPTURE  = 50
-    #W_PASSED   = 60
-    #W_PASSED_DIST = 12
-    W_SUPPORT  = 8
-    W_CONNECTED = 8
-    W_BLOCKED  = -8
-    W_CENTER   = 3
-    INF = 10**9
+    if white & white_goal_rank:
+        return INF_l
 
-    if white & white_goal_rank7:
-        return INF
-
-    if black & black_goal_rank0:
-        return -INF
+    if black & black_goal_rank:
+        return -INF_l
 
     #material
 
     white_count = white.bit_count()
     black_count = black.bit_count()
-    material = (white_count - black_count) * W_MATERIAL
+    material = (white_count - black_count) * W_MATERIAL_l
 
     #advancement
-    white_advancement = 0
-    for index in bit_scan(white):
-        white_advancement += (index // 8)
-        if index // 8 > 4:
-            white_advancement += (4*(index//8 - 4))**2
-    for index in bit_scan(black):
-        white_advancement -= (7 - index // 8)
-        if index // 8 < 3:
-            white_advancement -= (4*(3 - index // 8))**2
-
-    advancement = white_advancement * W_ADVANCE
+    white_adv_sum = sum_tbl(white, adv_w)
+    black_adv_sum = sum_tbl(black, adv_b)
+    advancement = (white_adv_sum - black_adv_sum) * W_ADVANCE_l
     
     #mobility
-    white_mobility = calc_mobility_white(white,black).bit_count()
-    black_mobility = calc_mobility_black(black,white).bit_count()
-    mobility = (white_mobility - black_mobility) * W_MOB
+    white_mobility = calc_mob_w(white,black)
+    black_mobility = calc_mob_b(black,white)
+    mobility = (white_mobility.bit_count() - black_mobility.bit_count()) * W_MOB_l
 
     #captures
-    w_attacks = (((white << 9) & ~right_edge) | ((white << 7) & ~left_edge))
-    b_attacks = (((black >> 9) & ~left_edge)  | ((black >> 7) & ~right_edge))
-    w_captures = (w_attacks & black).bit_count()
-    b_captures = (b_attacks & white).bit_count()
-    capture_score = (w_captures - b_captures) * W_CAPTURE
+    w_attacks = (((white << 9) & ~re) | ((white << 7) & ~le))
+    b_attacks = (((black >> 9) & ~le)  | ((black >> 7) & ~re))
+    capture_score = ( (w_attacks & black).bit_count() - (b_attacks & white).bit_count() ) * W_CAPTURE_l
 
     #blocked pawns
-    all_moves_white = calc_mobility_white(white, black)
-    pawns_with_moves = ((all_moves_white >> 8) | (all_moves_white >> 9) | (all_moves_white >> 7)) & white
+    pawns_with_moves = ((white_mobility >> 8) | (white_mobility >> 9) | (white_mobility >> 7)) & white
     blocked_pawns = white & ~pawns_with_moves
     num_blocked_white = blocked_pawns.bit_count()
 
-    all_moves_black = calc_mobility_black(black, white)
-    pawns_with_moves_black = ((all_moves_black << 8) | (all_moves_black << 9) | (all_moves_black << 7)) & black
+    pawns_with_moves_black = ((black_mobility << 8) | (black_mobility << 9) | (black_mobility << 7)) & black
     blocked_pawns_black = black & ~pawns_with_moves_black
     num_blocked_black = blocked_pawns_black.bit_count()
 
-    blocked_pawns = (num_blocked_white - num_blocked_black) * W_BLOCKED
+    blocked_pawns = (num_blocked_white - num_blocked_black) * W_BLOCKED_l
 
     #center
-    center = ((ring_mask_1 & white).bit_count() - (ring_mask_1 & black).bit_count()) * W_CENTER * 3
-    center += ((ring_mask_2 & white).bit_count() - (ring_mask_2 & black).bit_count()) * W_CENTER * 2
-    center += ((ring_mask_3 & white).bit_count() - (ring_mask_3 & black).bit_count()) * W_CENTER * 1
+    center_score = _sum_table_for_bitboard(white, center_tbl) - _sum_table_for_bitboard(black, center_tbl)
 
-
-    end = time.perf_counter()
-    evalTime += end - start
-    return material + advancement + mobility + capture_score + blocked_pawns + center
+    return material + advancement + mobility + capture_score + blocked_pawns + center_score
 
 
 def make_move(white, black, move, is_white):
@@ -242,7 +306,7 @@ def make_move(white, black, move, is_white):
 def game_over(white,black):
     return white & white_goal_rank7 or black & black_goal_rank0
 
-def compute_hash(white_bb, black_bb, whiteToPlay):
+def compute_hash(white_bb, black_bb, whiteToMove):
     h = 0
     # White pieces
     for square in range(64):
@@ -253,7 +317,7 @@ def compute_hash(white_bb, black_bb, whiteToPlay):
         if (black_bb >> square) & 1:
             h ^= zobrist[1][square]
     # Side to move
-    if not whiteToPlay:
+    if not whiteToMove:
         h ^= zobrist_side
     return h
 
@@ -339,7 +403,13 @@ def generate_dangerous_moves(white, black, maximizingPlayer):
     return moves
 
 def quiescence(white, black, alpha, beta, maximizingPlayer, hash_key):
-    stand_pat = evaluate_board(white, black)
+
+    eval_fn = evaluate_board_cached   # or evaluate_board
+    make_move_local = make_move
+    update_hash_local = update_hash
+    is_capture_local = is_capture
+
+    stand_pat = eval_fn(white, black)
     
     if maximizingPlayer:
         if stand_pat >= beta:
@@ -361,9 +431,9 @@ def quiescence(white, black, alpha, beta, maximizingPlayer, hash_key):
     if maximizingPlayer:
         max_eval = alpha
         for move in moves:
-            new_white, new_black = make_move(white, black, move, is_white=True)
-            new_hash = update_hash(hash_key, piece=0, sq_from=move[0], sq_to=move[1],
-                                   captured_piece=1 if is_capture(black, white, move, True) else None,
+            new_white, new_black = make_move_local(white, black, move, is_white=True)
+            new_hash = update_hash_local(hash_key, piece=0, sq_from=move[0], sq_to=move[1],
+                                   captured_piece=1 if is_capture_local(black, white, move, True) else None,
                                    side_to_move_changed=True)
             eval = quiescence(new_white, new_black, alpha, beta, False, new_hash)
             max_eval = max(max_eval, eval)
@@ -374,9 +444,9 @@ def quiescence(white, black, alpha, beta, maximizingPlayer, hash_key):
     else:
         min_eval = beta
         for move in moves:
-            new_white, new_black = make_move(white, black, move, is_white=False)
-            new_hash = update_hash(hash_key, piece=1, sq_from=move[0], sq_to=move[1],
-                                   captured_piece=0 if is_capture(black, white, move, False) else None,
+            new_white, new_black = make_move_local(white, black, move, is_white=False)
+            new_hash = update_hash_local(hash_key, piece=1, sq_from=move[0], sq_to=move[1],
+                                   captured_piece=0 if is_capture_local(black, white, move, False) else None,
                                    side_to_move_changed=True)
             eval = quiescence(new_white, new_black, alpha, beta, True, new_hash)
             min_eval = min(min_eval, eval)
@@ -387,17 +457,26 @@ def quiescence(white, black, alpha, beta, maximizingPlayer, hash_key):
 
 def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, hash_key=None):
     
+    tt_local = tt
+    EXACT_l, LOWER_l, UPPER_l = EXACT, LOWERBOUND, UPPERBOUND
+    make_move_local = make_move
+    order_moves_local = order_moves
+    generate_white_local = generate_all_white_moves
+    generate_black_local = generate_all_black_moves
+    update_hash_local = update_hash
+    is_capture_local = is_capture
+
     if hash_key is None:
         hash_key = compute_hash(white, black, maximizingPlayer)
 
-    if hash_key in tt:
-        entry = tt[hash_key]
+    if hash_key in tt_local:
+        entry = tt_local[hash_key]
         if entry["depth"] >= depth:  # only trust if searched deep enough
-            if entry["flag"] == EXACT:
+            if entry["flag"] == EXACT_l:
                 return entry["score"], entry["best_move"]
-            elif entry["flag"] == LOWERBOUND and entry["score"] >= beta:
+            elif entry["flag"] == LOWER_l and entry["score"] >= beta:
                 return entry["score"], entry["best_move"]
-            elif entry["flag"] == UPPERBOUND and entry["score"] <= alpha:
+            elif entry["flag"] == UPPER_l and entry["score"] <= alpha:
                 return entry["score"], entry["best_move"]
     
     if depth == 0 or game_over(white, black):
@@ -408,14 +487,14 @@ def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, ha
 
     if maximizingPlayer:  # White to move
         max_eval = -float('inf')
-        moves = generate_all_white_moves(white, black)
+        moves = generate_white_local(white, black)
 
-        tt_move = tt[hash_key]["best_move"] if hash_key in tt else None
-        moves = order_moves(moves, white, black, True, pv_move, tt_move)
+        tt_move = tt_local[hash_key]["best_move"] if hash_key in tt_local else None
+        moves = order_moves_local(moves, white, black, True, pv_move, tt_move)
         for move in moves:
-            new_white, new_black = make_move(white, black, move, is_white=True)
-            new_hash = update_hash(hash_key, piece=0, sq_from=move[0], sq_to=move[1],
-                                   captured_piece=1 if is_capture(black, white, move, True) else None,
+            new_white, new_black = make_move_local(white, black, move, is_white=True)
+            new_hash = update_hash_local(hash_key, piece=0, sq_from=move[0], sq_to=move[1],
+                                   captured_piece=1 if is_capture_local(black, white, move, True) else None,
                                    side_to_move_changed=True)
             eval, _ = minimax(new_white, new_black, depth-1, alpha, beta, False, pv_move, new_hash)
             if eval > max_eval:
@@ -427,14 +506,14 @@ def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, ha
         score = max_eval
     else:  # Black to move
         min_eval = float('inf')
-        moves = generate_all_black_moves(white, black)
+        moves = generate_black_local(white, black)
 
-        tt_move = tt[hash_key]["best_move"] if hash_key in tt else None
-        moves = order_moves(moves, white, black, False, pv_move, tt_move)
+        tt_move = tt_local[hash_key]["best_move"] if hash_key in tt_local else None
+        moves = order_moves_local(moves, white, black, False, pv_move, tt_move)
         for move in moves:
-            new_white, new_black = make_move(white, black, move, is_white=False)
-            new_hash = update_hash(hash_key, piece=1, sq_from=move[0], sq_to=move[1],
-                                   captured_piece=0 if is_capture(black, white, move, False) else None,
+            new_white, new_black = make_move_local(white, black, move, is_white=False)
+            new_hash = update_hash_local(hash_key, piece=1, sq_from=move[0], sq_to=move[1],
+                                   captured_piece=0 if is_capture_local(black, white, move, False) else None,
                                    side_to_move_changed=True)
             eval, _ = minimax(new_white, new_black, depth-1, alpha, beta, True, pv_move, new_hash)
             if eval < min_eval:
@@ -446,13 +525,13 @@ def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, ha
         score = min_eval
     
     if score <= alpha: 
-        flag = UPPERBOUND
+        flag = UPPER_l
     elif score >= beta:
-        flag = LOWERBOUND
+        flag = LOWER_l
     else:
-        flag = EXACT
+        flag = EXACT_l
 
-    tt[hash_key] = {
+    tt_local[hash_key] = {
         "depth": depth,
         "score": score,
         "flag": flag,
@@ -460,14 +539,15 @@ def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, ha
     }
 
     return score, best_move
-    
-def iterative_deepening(white, black, max_depth, time_limit=None):
+
+def iterative_deepening(white, black, max_depth, time_limit=None, whiteToMove=False):
     start_time = time.time()
     best_move = None
+    root_hash = compute_hash(white, black, whiteToMove=whiteToMove)
 
     for depth in range(1, max_depth + 1):
         # Call minimax with alpha-beta pruning
-        eval, move = minimax(white, black, depth, -float('inf'), float('inf'), False, pv_move=best_move)  # Assume black to move first
+        eval, move = minimax(white, black, depth, -float('inf'), float('inf'), False, pv_move=best_move, hash_key=root_hash)  # Assume black to move first
         if move is not None:
             best_move = move
 
@@ -519,12 +599,12 @@ while True:
             print("Black wins!")
         break
     start = time.perf_counter()
-    board_eval, engine_move = iterative_deepening(white_board, black_board, DEPTH, time_limit=1)
+    board_eval, engine_move = iterative_deepening(white_board, black_board, DEPTH, time_limit=100)
     end = time.perf_counter()
     print(end - start, "seconds for engine move calculation")
     white_board, black_board = make_move(white_board, black_board, engine_move, is_white=False)
     print(board_eval, "Engine move:", engine_move)
-    print(globalCounter, evalTime)
+    print("Evaluated positions: ", globalCounter)
     evalTime = globalCounter = 0
     if game_over(white_board, black_board):
         if white_board & white_goal_rank7:
