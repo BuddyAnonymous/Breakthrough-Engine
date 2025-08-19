@@ -7,13 +7,12 @@ zobrist_side = random.getrandbits(64)
 
 tt = {}
 EXACT, LOWERBOUND, UPPERBOUND = 0, 1, 2
-
-above_rank_3_white = 0xFFFFFF0000000000
-above_rank_3_black = 0x0000000000FFFFFF
-white_board = 0x000000000000FFFF
+above_rank_2_white = 0xFFFF000000000000
+above_rank_2_black = 0x000000000000FFFF
+white_board = 0x000000000000FFFF #DEFAULT
 #white_board = 0x0000000816588000
 #black_board = 0x002E4C1000000000
-black_board = 0xFFFF000000000000
+black_board = 0xFFFF000000000000 #DEFAULT
 right_edge = 0x0101010101010101
 left_edge = 0x8080808080808080
 white_goal_rank7 = 0xFF00000000000000
@@ -23,7 +22,7 @@ ring_mask_2 = 0x00003C24243C0000
 ring_mask_3 = 0x007E424242427E00
 ring_mask_4 = 0xFF818181818181FF
 MASK64 = 0xFFFFFFFFFFFFFFFF  # 64-bit mask
-DEPTH = 14
+DEPTH = 30
 evalTime = 0
 globalCounter = 0
 W_MATERIAL = 100
@@ -58,12 +57,16 @@ for sq in range(64):
     val = rank
     if rank > 4:
         val += (4*(rank - 4))**2
+    if rank == 4:
+        val = 7
     adv_table_white[sq] = val
 
     # for black your code subtracts (7 - rank) and if rank < 3 adds penalty
     valb = (7 - rank)
     if rank < 3:
         valb += (4*(3 - rank))**2
+    if rank == 3:
+        valb = 7
     adv_table_black[sq] = valb
 
 def _sum_table_for_bitboard(bb, table):
@@ -75,7 +78,7 @@ def _sum_table_for_bitboard(bb, table):
         bb ^= lsb
     return s
 
-advancement = {7: 10000000, 6: 10000 , 5:200, 0:10000000, 1:10000, 2:200}
+advancement = {7: 10000000, 6: 10000 , 5:200, 4:60, 0:10000000, 1:10000, 2:200, 3:60}
 
 _eval_cache = {}
 
@@ -243,7 +246,7 @@ def evaluate_board(white,black):
     if white & white_goal_rank:
         return INF_l
 
-    if black & black_goal_rank:
+    if black & black_goal_rank or not white:
         return -INF_l
 
     #material
@@ -363,13 +366,13 @@ def generate_dangerous_moves(white, black, maximizingPlayer):
         for to_sq in bit_scan(right_targets):
             from_sq = to_sq - 7
             moves.append((from_sq, to_sq))
-        for to_sq in bit_scan(forward_moves & ~white & ~black & above_rank_3_white):
+        for to_sq in bit_scan(forward_moves & ~white & ~black & above_rank_2_white):
             from_sq = to_sq - 8
             moves.append((from_sq, to_sq))
-        for to_sq in bit_scan(left_moves & ~white & ~black & above_rank_3_white):
+        for to_sq in bit_scan(left_moves & ~white & ~black & above_rank_2_white):
             from_sq = to_sq - 9
             moves.append((from_sq, to_sq))
-        for to_sq in bit_scan(right_moves & ~white & ~black & above_rank_3_white):
+        for to_sq in bit_scan(right_moves & ~white & ~black & above_rank_2_white):
             from_sq = to_sq - 7
             moves.append((from_sq, to_sq))
     else:  # Black to move
@@ -388,15 +391,15 @@ def generate_dangerous_moves(white, black, maximizingPlayer):
             from_sq = to_sq + 9
             moves.append((from_sq, to_sq))
 
-        for to_sq in bit_scan(forward_moves & ~white & ~black & above_rank_3_black):
+        for to_sq in bit_scan(forward_moves & ~white & ~black & above_rank_2_black):
             from_sq = to_sq + 8
             moves.append((from_sq, to_sq))
         
-        for to_sq in bit_scan(left_moves & ~white & ~black & above_rank_3_black):
+        for to_sq in bit_scan(left_moves & ~white & ~black & above_rank_2_black):
             from_sq = to_sq + 7
             moves.append((from_sq, to_sq))
         
-        for to_sq in bit_scan(right_moves & ~white & ~black & above_rank_3_black):
+        for to_sq in bit_scan(right_moves & ~white & ~black & above_rank_2_black):
             from_sq = to_sq + 9
             moves.append((from_sq, to_sq))
 
@@ -422,6 +425,8 @@ def quiescence(white, black, alpha, beta, maximizingPlayer, hash_key):
         if stand_pat < beta:
             beta = stand_pat
 
+    if stand_pat >= 1000000 or stand_pat <= -1000000:
+        return stand_pat
     # Generate only capture moves
     moves = generate_dangerous_moves(white, black, maximizingPlayer)
 
@@ -456,7 +461,6 @@ def quiescence(white, black, alpha, beta, maximizingPlayer, hash_key):
         return min_eval
 
 def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, hash_key=None):
-    
     tt_local = tt
     EXACT_l, LOWER_l, UPPER_l = EXACT, LOWERBOUND, UPPERBOUND
     make_move_local = make_move
@@ -547,7 +551,7 @@ def iterative_deepening(white, black, max_depth, time_limit=None, whiteToMove=Fa
 
     for depth in range(1, max_depth + 1):
         # Call minimax with alpha-beta pruning
-        eval, move = minimax(white, black, depth, -float('inf'), float('inf'), False, pv_move=best_move, hash_key=root_hash)  # Assume black to move first
+        eval, move = minimax(white, black, depth, -float('inf'), float('inf'), whiteToMove, pv_move=best_move, hash_key=root_hash)  # Assume black to move first
         if move is not None:
             best_move = move
 
@@ -555,12 +559,12 @@ def iterative_deepening(white, black, max_depth, time_limit=None, whiteToMove=Fa
         if time_limit and (time.time() - start_time) >= time_limit:
             print(f"Time limit reached at depth {depth}. Time {time.time() - start_time:.2f} seconds")
             break
-        if eval > 1000000:
+        if eval >= 1000000 or eval <= -1000000:
             print(f"Early exit at depth {depth} with evaluation {eval}, time {time.time() - start_time:.2f} seconds")
             break
 
-    return eval, best_move
 
+    return eval, best_move
 
 while True:
     print_board(white_board, black_board)
@@ -599,13 +603,12 @@ while True:
             print("Black wins!")
         break
     start = time.perf_counter()
-    board_eval, engine_move = iterative_deepening(white_board, black_board, DEPTH, time_limit=100)
+    print_board(white_board, black_board)
+    board_eval, engine_move = iterative_deepening(white_board, black_board, DEPTH, time_limit=0.4)
     end = time.perf_counter()
     print(end - start, "seconds for engine move calculation")
     white_board, black_board = make_move(white_board, black_board, engine_move, is_white=False)
     print(board_eval, "Engine move:", engine_move)
-    print("Evaluated positions: ", globalCounter)
-    evalTime = globalCounter = 0
     if game_over(white_board, black_board):
         if white_board & white_goal_rank7:
             print("White wins!")
