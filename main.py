@@ -6,13 +6,24 @@ zobrist = [[random.getrandbits(64) for _ in range(64)] for _ in range(2)]
 zobrist_side = random.getrandbits(64)
 
 tt = {}
+ply_count = 30
 EXACT, LOWERBOUND, UPPERBOUND = 0, 1, 2
 above_rank_2_white = 0xFFFF000000000000
 above_rank_2_black = 0x000000000000FFFF
-white_board = 0x000000000000FFFF #DEFAULT
+#white_board = 0x000000000000FFFF #DEFAULT
+#white_board = 0x0000000C00000080 #bug1
+#black_board = 0x003E000000000000 #bug1
+white_board = 0x0000000400200000 #FASTEST WIN
+black_board = 0x0036000800000000 #FASTEST WIN
+white_board_check = 0x0000000420000000
+black_board_check = 0x0036000008000000
+bug_white_board = 0x0000000400200000
+bug_black_board = 0x0036000800000000
+#white_board = 0x0000000410000000 #bug
+#black_board = 0x0014048000000000 #bug
 #white_board = 0x0000000816588000
 #black_board = 0x002E4C1000000000
-black_board = 0xFFFF000000000000 #DEFAULT
+#black_board = 0xFFFF000000000000 #DEFAULT
 right_edge = 0x0101010101010101
 left_edge = 0x8080808080808080
 white_goal_rank7 = 0xFF00000000000000
@@ -26,7 +37,7 @@ DEPTH = 30
 evalTime = 0
 globalCounter = 0
 W_MATERIAL = 100
-W_ADVANCE  = 20
+W_ADVANCE  = 10
 W_MOB      = 5
 W_CAPTURE  = 50
 #W_PASSED   = 60
@@ -48,25 +59,25 @@ for sq in range(64):
         center_table[sq] = W_CENTER * 1
     else:
         center_table[sq] = 0
-
+adv_table_early_white = [0]*64
+adv_table_early_black = [0]*64
 adv_table_white = [0]*64
 adv_table_black = [0]*64
+for sq in range(64):
+    rank = sq // 8
+    adv_table_early_white[sq] = rank
 for sq in range(64):
     rank = sq // 8
     # original had: add rank, and if rank > 4 some quadratic bonus
     val = rank
     if rank > 4:
         val += (4*(rank - 4))**2
-    if rank == 4:
-        val = 7
     adv_table_white[sq] = val
 
     # for black your code subtracts (7 - rank) and if rank < 3 adds penalty
     valb = (7 - rank)
     if rank < 3:
         valb += (4*(3 - rank))**2
-    if rank == 3:
-        valb = 7
     adv_table_black[sq] = valb
 
 def _sum_table_for_bitboard(bb, table):
@@ -79,18 +90,6 @@ def _sum_table_for_bitboard(bb, table):
     return s
 
 advancement = {7: 10000000, 6: 10000 , 5:200, 4:60, 0:10000000, 1:10000, 2:200, 3:60}
-
-_eval_cache = {}
-
-def evaluate_board_cached(white, black, hash_key=None):
-    if hash_key is not None:
-        v = _eval_cache.get(hash_key)
-        if v is not None:
-            return v
-    score = evaluate_board(white, black)   # your existing, pure evaluator
-    if hash_key is not None:
-        _eval_cache[hash_key] = score
-    return score
 
 def print_board(white, black):
     print("  +-----------------+")
@@ -222,10 +221,8 @@ def order_moves(moves, white, black, whiteToMove, pv_move=None, tt_move=None):
 
     return sorted(moves, key=key, reverse=True)
 
-def evaluate_board(white,black):
-    #global globalCounter
+def evaluate_board(white,black,current_depth):
 
-    #globalCounter += 1
     W_MATERIAL_l = W_MATERIAL
     W_ADVANCE_l = W_ADVANCE
     W_MOB_l = W_MOB
@@ -243,11 +240,11 @@ def evaluate_board(white,black):
     white_goal_rank = white_goal_rank7
     black_goal_rank = black_goal_rank0
 
-    if white & white_goal_rank:
-        return INF_l
+    if white & white_goal_rank or not black:
+        return INF_l - current_depth
 
     if black & black_goal_rank or not white:
-        return -INF_l
+        return -INF_l + current_depth
 
     #material
 
@@ -256,8 +253,12 @@ def evaluate_board(white,black):
     material = (white_count - black_count) * W_MATERIAL_l
 
     #advancement
-    white_adv_sum = sum_tbl(white, adv_w)
-    black_adv_sum = sum_tbl(black, adv_b)
+    if ply_count < 15:
+        white_adv_sum = sum_tbl(white, adv_table_early_white)
+        black_adv_sum = sum_tbl(black, adv_table_early_black)
+    else:
+        white_adv_sum = sum_tbl(white, adv_w)
+        black_adv_sum = sum_tbl(black, adv_b)
     advancement = (white_adv_sum - black_adv_sum) * W_ADVANCE_l
     
     #mobility
@@ -405,62 +406,133 @@ def generate_dangerous_moves(white, black, maximizingPlayer):
 
     return moves
 
-def quiescence(white, black, alpha, beta, maximizingPlayer, hash_key):
-
-    eval_fn = evaluate_board_cached   # or evaluate_board
+def quiescence(white, black, alpha, beta, maximizingPlayer, hash_key, current_depth):
+    eval_fn = evaluate_board
     make_move_local = make_move
     update_hash_local = update_hash
     is_capture_local = is_capture
+    tt_local = tt
+    score = None
 
-    stand_pat = eval_fn(white, black)
-    
+    # --- TT lookup ---
+    if hash_key in tt_local:
+        score = tt_local[hash_key]["score"]
+        # Denormalize mate scores
+        if score >= INF - 1000:
+            return score - current_depth
+        elif score <= -INF + 1000:
+            return score + current_depth
+
+    # --- Static eval (stand pat) ---
+    if score is not None:
+        stand_pat = score
+    else:
+        stand_pat = eval_fn(white, black, current_depth=current_depth)
+
+    if stand_pat >= INF - 1000 or stand_pat <= -INF + 1000:
+        return stand_pat
+
     if maximizingPlayer:
         if stand_pat >= beta:
+            # store in TT (fail-high)
+            tt_local[hash_key] = {
+                "depth": 0,
+                "score": stand_pat,
+                "flag": LOWERBOUND,
+                "best_move": None
+            }
             return beta
         if stand_pat > alpha:
             alpha = stand_pat
     else:
         if stand_pat <= alpha:
+            # store in TT (fail-low)
+            tt_local[hash_key] = {
+                "depth": 0,
+                "score": stand_pat,
+                "flag": UPPERBOUND,
+                "best_move": None
+            }
             return alpha
         if stand_pat < beta:
             beta = stand_pat
 
-    if stand_pat >= 1000000 or stand_pat <= -1000000:
-        return stand_pat
-    # Generate only capture moves
+    # --- Generate captures only ---
     moves = generate_dangerous_moves(white, black, maximizingPlayer)
 
     if not moves:
-        return stand_pat  # no more captures
+        # no captures left → store exact
+        tt_local[hash_key] = {
+            "depth": 0,
+            "score": stand_pat,
+            "flag": EXACT,
+            "best_move": None
+        }
+        return stand_pat
+
+    best_move = None
 
     if maximizingPlayer:
         max_eval = alpha
         for move in moves:
             new_white, new_black = make_move_local(white, black, move, is_white=True)
-            new_hash = update_hash_local(hash_key, piece=0, sq_from=move[0], sq_to=move[1],
-                                   captured_piece=1 if is_capture_local(black, white, move, True) else None,
-                                   side_to_move_changed=True)
-            eval = quiescence(new_white, new_black, alpha, beta, False, new_hash)
-            max_eval = max(max_eval, eval)
+            new_hash = update_hash_local(
+                hash_key, piece=0, sq_from=move[0], sq_to=move[1],
+                captured_piece=1 if is_capture_local(black, white, move, True) else None,
+                side_to_move_changed=True
+            )
+            eval = quiescence(new_white, new_black, alpha, beta, False, new_hash, current_depth+1)
+            if eval > max_eval:
+                max_eval = eval
+                best_move = move
             alpha = max(alpha, eval)
             if beta <= alpha:
                 break
+        # store in TT
+        flag = EXACT
+        if max_eval <= alpha:  # fail-low
+            flag = UPPERBOUND
+        elif max_eval >= beta:  # fail-high
+            flag = LOWERBOUND
+        tt_local[hash_key] = {
+            "depth": 0,
+            "score": max_eval,
+            "flag": flag,
+            "best_move": best_move
+        }
         return max_eval
+
     else:
         min_eval = beta
         for move in moves:
             new_white, new_black = make_move_local(white, black, move, is_white=False)
-            new_hash = update_hash_local(hash_key, piece=1, sq_from=move[0], sq_to=move[1],
-                                   captured_piece=0 if is_capture_local(black, white, move, False) else None,
-                                   side_to_move_changed=True)
-            eval = quiescence(new_white, new_black, alpha, beta, True, new_hash)
-            min_eval = min(min_eval, eval)
+            new_hash = update_hash_local(
+                hash_key, piece=1, sq_from=move[0], sq_to=move[1],
+                captured_piece=0 if is_capture_local(black, white, move, False) else None,
+                side_to_move_changed=True
+            )
+            eval = quiescence(new_white, new_black, alpha, beta, True, new_hash, current_depth+1)
+            if eval < min_eval:
+                min_eval = eval
+                best_move = move
             beta = min(beta, eval)
             if beta <= alpha:
                 break
+        # store in TT
+        flag = EXACT
+        if min_eval <= alpha:  # fail-low
+            flag = UPPERBOUND
+        elif min_eval >= beta:  # fail-high
+            flag = LOWERBOUND
+        tt_local[hash_key] = {
+            "depth": 0,
+            "score": min_eval,
+            "flag": flag,
+            "best_move": best_move
+        }
         return min_eval
 
-def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, hash_key=None):
+def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, hash_key=None, current_depth=0):
     tt_local = tt
     EXACT_l, LOWER_l, UPPER_l = EXACT, LOWERBOUND, UPPERBOUND
     make_move_local = make_move
@@ -475,6 +547,12 @@ def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, ha
 
     if hash_key in tt_local:
         entry = tt_local[hash_key]
+        score = entry["score"]
+        if entry["score"] >= INF - 1000:
+            return score , entry["best_move"]
+        elif entry["score"] <= -INF + 1000:
+            return score , entry["best_move"]
+
         if entry["depth"] >= depth:  # only trust if searched deep enough
             if entry["flag"] == EXACT_l:
                 return entry["score"], entry["best_move"]
@@ -484,7 +562,7 @@ def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, ha
                 return entry["score"], entry["best_move"]
     
     if depth == 0 or game_over(white, black):
-        score = quiescence(white, black, alpha, beta, maximizingPlayer, hash_key)
+        score = quiescence(white, black, alpha, beta, maximizingPlayer, hash_key, current_depth)
         return score, None
 
     best_move = None
@@ -500,7 +578,7 @@ def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, ha
             new_hash = update_hash_local(hash_key, piece=0, sq_from=move[0], sq_to=move[1],
                                    captured_piece=1 if is_capture_local(black, white, move, True) else None,
                                    side_to_move_changed=True)
-            eval, _ = minimax(new_white, new_black, depth-1, alpha, beta, False, pv_move, new_hash)
+            eval, _ = minimax(new_white, new_black, depth-1, alpha, beta, False, pv_move, new_hash, current_depth=current_depth+1)
             if eval > max_eval:
                 max_eval = eval
                 best_move = move
@@ -519,7 +597,7 @@ def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, ha
             new_hash = update_hash_local(hash_key, piece=1, sq_from=move[0], sq_to=move[1],
                                    captured_piece=0 if is_capture_local(black, white, move, False) else None,
                                    side_to_move_changed=True)
-            eval, _ = minimax(new_white, new_black, depth-1, alpha, beta, True, pv_move, new_hash)
+            eval, _ = minimax(new_white, new_black, depth-1, alpha, beta, True, pv_move, new_hash, current_depth=current_depth+1)
             if eval < min_eval:
                 min_eval = eval
                 best_move = move
@@ -534,14 +612,13 @@ def minimax(white, black, depth, alpha, beta, maximizingPlayer, pv_move=None, ha
         flag = LOWER_l
     else:
         flag = EXACT_l
-
-    tt_local[hash_key] = {
-        "depth": depth,
-        "score": score,
-        "flag": flag,
-        "best_move": best_move
-    }
-
+    if hash_key not in tt_local or tt_local[hash_key]["depth"] < depth:
+        tt_local[hash_key] = {
+            "depth": depth,
+            "score": score,
+            "flag": flag,
+            "best_move": best_move
+        }
     return score, best_move
 
 def iterative_deepening(white, black, max_depth, time_limit=None, whiteToMove=False):
@@ -566,8 +643,16 @@ def iterative_deepening(white, black, max_depth, time_limit=None, whiteToMove=Fa
 
     return eval, best_move
 
+# print_board(check_white_board, check_black_board)
+# print(generate_all_black_moves(bug_white_board, bug_black_board))
+# print(generate_all_white_moves(bug_white_board, bug_black_board))
+# print_board(bug_white_board, bug_black_board)
+# root_hash = compute_hash(bug_white_board, bug_black_board, whiteToMove=True)
+# print(minimax(bug_white_board, bug_black_board, 15, -float('inf'), float('inf'), True, hash_key=root_hash))
+# print(minimaxCounter,quiescenceCounter)
 while True:
     print_board(white_board, black_board)
+    print("tt size = ", len(tt))
 
     # Get player input
     move_input = input("Enter your move (from_col from_row to_col to_row): ")
@@ -596,6 +681,15 @@ while True:
     # Make the move
     white_board, black_board = make_move(white_board, black_board, move, is_white=True)
     print("Move played!")
+    ply_count += 1
+
+    # start = time.perf_counter()
+    # board_eval, engine_move = iterative_deepening(white_board, black_board, DEPTH, time_limit=5, whiteToMove=True)
+    # end = time.perf_counter()
+    # print(end - start, "seconds for engine move calculation")
+    # white_board, black_board = make_move(white_board, black_board, engine_move, is_white=True)
+    # print(board_eval, "Engine move:", engine_move)
+
     if game_over(white_board, black_board):
         if white_board & white_goal_rank7:
             print("White wins!")
@@ -604,17 +698,15 @@ while True:
         break
     start = time.perf_counter()
     print_board(white_board, black_board)
-    board_eval, engine_move = iterative_deepening(white_board, black_board, DEPTH, time_limit=0.4)
+    board_eval, engine_move = iterative_deepening(white_board, black_board, DEPTH, time_limit=10)
     end = time.perf_counter()
     print(end - start, "seconds for engine move calculation")
     white_board, black_board = make_move(white_board, black_board, engine_move, is_white=False)
     print(board_eval, "Engine move:", engine_move)
+    ply_count += 1
     if game_over(white_board, black_board):
         if white_board & white_goal_rank7:
             print("White wins!")
         elif black_board & black_goal_rank0:
             print("Black wins!")
         break
-
-
-    
